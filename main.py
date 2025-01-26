@@ -7,6 +7,7 @@ from langchain_core.messages import HumanMessage
 from bson import ObjectId
 import time
 from datetime import datetime
+from typing import List, Optional
 
 # AI Configuration
 generate_llm = ChatGroq(
@@ -183,3 +184,121 @@ async def submit_recovery(input: RecoveryInput):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
+    
+
+
+db1 = client.habit_tracker
+habits_collection = db1.habits
+
+class Habit(BaseModel):
+    userId: str
+    title: str
+    repetition: str
+    customDays: List[str] = []
+    time: Optional[str] = None
+    completed: bool = False
+    skipped: bool = False
+    reason: Optional[str] = None
+    tip: Optional[str] = None
+
+@app.post("/log-habit")
+async def log_habit(habit: Habit):
+    habit_data = {
+        "userId": habit.userId,
+        "title": habit.title,
+        "repetition": habit.repetition,
+        "customDays": habit.customDays,
+        "time": habit.time,
+        "completed": habit.completed,
+        "skipped": habit.skipped,
+        "reason": habit.reason,
+        "tip": habit.tip,
+        "createdAt": datetime.utcnow(),
+    }
+
+    result =  habits_collection.insert_one(habit_data)
+    if result.inserted_id:
+        return {"message": "Habit logged successfully", "habitId": str(result.inserted_id)}
+    else:
+        raise HTTPException(status_code=500, detail="Failed to log habit")
+
+# from bson import ObjectId  # Import ObjectId for conversion
+
+@app.get("/get-habits")
+async def get_habits(userId: str):
+    try:
+        # Fetch habits from MongoDB
+        habits = habits_collection.find({"userId": userId}).to_list(length=100)
+
+        # Convert ObjectId to string for each habit
+        for habit in habits:
+            habit["_id"] = str(habit["_id"])
+
+        return {"habits": habits}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/update-habit/completed/{habit_id}")
+async def complete_habit(habit_id: str):
+    try:
+        # Validate the habit_id as a MongoDB ObjectId
+        object_id = ObjectId(habit_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid habit ID")
+
+    # Update the habit in MongoDB
+    update_result =  habits_collection.update_one(
+        {"_id": object_id},
+        {"$set": {"completed": True, "skipped": False}}
+    )
+
+    if update_result.modified_count == 1:
+        return {"message": "Habit marked as completed"}
+    else:
+        raise HTTPException(status_code=404, detail="Habit not found")
+
+
+
+class SkipHabitRequest(BaseModel):
+    reason: str
+
+
+
+@app.put("/update-habit/skipped/{habit_id}")
+async def skip_habit(habit_id: str, request: SkipHabitRequest):
+    try:
+        object_id = ObjectId(habit_id)  # Validate the ObjectId
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid habit ID")
+
+    tip = generate_tip(request.reason)
+    update_result =  habits_collection.update_one(
+        {"_id": object_id},
+        {"$set": {"skipped": True, "completed": False, "reason": request.reason, "tip": tip}}
+    )
+
+    if update_result.modified_count == 1:
+        return {"message": "Habit marked as skipped", "tip": tip}
+    else:
+        raise HTTPException(status_code=404, detail="Habit not found")
+
+def generate_tip(reason: str) -> str:
+    prompt_template = f"Generate a motivational tip for someone who says they skipped a habit because: '{reason}'."
+    response = generate_response(prompt_template)
+    if response:
+        return response
+    else:
+        return "Consistency is key. Don’t be too hard on yourself—start again tomorrow!"
+    
+
+@app.put("/update-habit/undo/{habit_id}")
+async def undo_habit(habit_id: str):
+    update_result =  habits_collection.update_one(
+        {"_id": ObjectId(habit_id)},
+        {"$set": {"completed": False, "skipped": False, "reason": None, "tip": None}}
+    )
+
+    if update_result.modified_count == 1:
+        return {"message": "Habit status reset successfully"}
+    else:
+        raise HTTPException(status_code=404, detail="Habit not found")
