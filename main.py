@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Body
 from pydantic import BaseModel
 from pymongo import MongoClient
 from fastapi.middleware.cors import CORSMiddleware
@@ -187,118 +187,195 @@ async def submit_recovery(input: RecoveryInput):
     
 
 
-db1 = client.habit_tracker
-habits_collection = db1.habits
+
+
+db = client.habit_tracker
+habits_collection = db.habits
+
+class HabitInstance(BaseModel):
+    datetime: datetime
+    status: str = "pending"
+    reason: Optional[str] = None
+    tip: Optional[str] = None
 
 class Habit(BaseModel):
     userId: str
     title: str
     repetition: str
     customDays: List[str] = []
-    time: Optional[str] = None
-    completed: bool = False
-    skipped: bool = False
-    reason: Optional[str] = None
-    tip: Optional[str] = None
+    time: Optional[str] = "00:00"  # Default to "00:00" if not provided
+    instances: List[HabitInstance] = []
+
+def is_due_today(habit: dict, today: datetime) -> bool:
+    if habit["repetition"] == "daily":
+        return True
+    elif habit["repetition"] == "custom":
+        return today.strftime("%A") in habit["customDays"]
+    return False
+
+@app.get("/get-todays-instances")
+async def get_todays_instances(userId: str):
+    habits =  habits_collection.find({"userId": userId}).to_list(None)
+    today = datetime.now().date()
+
+    for habit in habits:
+        if not is_due_today(habit, today):
+            continue
+
+        # Ensure time_str is not empty
+        time_str = habit.get("time", "00:00")
+        if not time_str:  # Handle empty time string
+            time_str = "00:00"
+
+        try:
+            instance_time = datetime.strptime(time_str, "%H:%M").time()
+        except ValueError:
+            # If time_str is invalid, default to "00:00"
+            instance_time = datetime.strptime("00:00", "%H:%M").time()
+
+        instance_datetime = datetime.combine(today, instance_time)
+
+        if not any(inst["datetime"] == instance_datetime for inst in habit.get("instances", [])):
+            new_instance = HabitInstance(datetime=instance_datetime)
+            habits_collection.update_one(
+                {"_id": habit["_id"]},
+                {"$push": {"instances": new_instance.dict()}}
+            )
+
+    updated_habits =  habits_collection.find({"userId": userId}).to_list(None)
+    todays_instances = []
+    for habit in updated_habits:
+        for inst in habit.get("instances", []):
+            if inst["datetime"].date() == today:
+                inst_data = {**inst, "habitId": str(habit["_id"]), "title": habit["title"]}
+                inst_data["datetime"] = inst_data["datetime"].isoformat()
+                todays_instances.append(inst_data)
+    
+    return {"instances": todays_instances}
+
+@app.get("/get-all-habits")
+async def get_all_habits(userId: str):
+    habits =  habits_collection.find({"userId": userId}).to_list(None)
+    for habit in habits:
+        habit["_id"] = str(habit["_id"])
+        habit["instances"] = [{
+            **inst,
+            "datetime": inst["datetime"].isoformat()
+        } for inst in habit.get("instances", [])]
+    return {"habits": habits}
+
+@app.get("/get-skipped-instances")
+async def get_skipped_instances(userId: str):
+    habits =  habits_collection.find({"userId": userId}).to_list(None)
+    skipped_instances = []
+    for habit in habits:
+        for inst in habit.get("instances", []):
+            if inst.get("status") == "skipped":
+                skipped_instances.append({
+                    **inst,
+                    "habitId": str(habit["_id"]),
+                    "title": habit["title"],
+                    "datetime": inst["datetime"].isoformat()
+                })
+    return {"instances": skipped_instances}
+
+
+
+from datetime import datetime
+
+class CompleteInstanceRequest(BaseModel):
+    instance_datetime: str
+
+@app.put("/complete-instance/{habit_id}")
+async def complete_instance(habit_id: str):
+    # Get the start and end of the current day
+    today = datetime.now()
+    start_of_day = today.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_of_day = today.replace(hour=23, minute=59, second=59, microsecond=999999)
+
+    # Debugging: Print time range
+    print(f"Marking completed for habit_id: {habit_id} from {start_of_day} to {end_of_day}")
+
+    # Update all instances for the current day
+    update_result = habits_collection.update_many(
+        {
+            "_id": ObjectId(habit_id),
+            "instances.datetime": {"$gte": start_of_day, "$lte": end_of_day}
+        },
+        {"$set": {"instances.$[elem].status": "completed"}},
+        array_filters=[{"elem.datetime": {"$gte": start_of_day, "$lte": end_of_day}}]
+    )
+
+    # Debugging: Check how many documents were updated
+    print(f"Update result: {update_result.modified_count} instance(s) updated")
+
+    if update_result.modified_count == 0:
+        return {"error": "No matching instances found for today"}
+
+    return {"message": "All instances for today marked as completed"}
+
+
+
+# from fastapi import Query
+
+# from fastapi import Body
+
+# from fastapi import Query
+
+from datetime import datetime
+
+@app.put("/skip-instance/{habit_id}")
+async def skip_instance(
+    habit_id: str,
+    reason: str = Query(...),
+    instance_datetime: str = Query(...),  # Date string
+):
+    # Convert the string to a datetime object
+    instance_datetime = datetime.fromisoformat(instance_datetime)
+
+    # Generate AI-powered tip
+    prompt_template = f"""Generate a short, empathetic motivational tip for someone who skipped their habit because '{reason}'. 
+    Encourage them to keep going tomorrow. Keep it under 2 sentences and use a friendly tone."""
+    
+    tip = generate_response(prompt_template, max_tokens=100)  # Get AI-generated tip
+    
+    # Fallback tip if AI generation fails
+    if not tip:
+        tip = f"Remember: Consistency is key! You skipped because '{reason}', but you can do better tomorrow!"
+
+    # Update the habit instance using the datetime object
+    update_result = habits_collection.update_one(
+        {
+            "_id": ObjectId(habit_id),
+            "instances.datetime": instance_datetime,
+            "instances.status": {"$ne": "skipped"}
+        },
+        {
+            "$set": {
+                "instances.$.status": "skipped",
+                "instances.$.reason": reason,
+                "instances.$.tip": tip
+            }
+        }
+    )
+
+    if update_result.modified_count == 0:
+        return {"error": "No matching instance found"}
+
+    return {"message": "Instance skipped", "generated_tip": tip}
+
 
 @app.post("/log-habit")
 async def log_habit(habit: Habit):
-    habit_data = {
-        "userId": habit.userId,
-        "title": habit.title,
-        "repetition": habit.repetition,
-        "customDays": habit.customDays,
-        "time": habit.time,
-        "completed": habit.completed,
-        "skipped": habit.skipped,
-        "reason": habit.reason,
-        "tip": habit.tip,
-        "createdAt": datetime.utcnow(),
-    }
-
-    result =  habits_collection.insert_one(habit_data)
-    if result.inserted_id:
-        return {"message": "Habit logged successfully", "habitId": str(result.inserted_id)}
-    else:
-        raise HTTPException(status_code=500, detail="Failed to log habit")
-
-# from bson import ObjectId  # Import ObjectId for conversion
-
-@app.get("/get-habits")
-async def get_habits(userId: str):
-    try:
-        # Fetch habits from MongoDB
-        habits = habits_collection.find({"userId": userId}).to_list(length=100)
-
-        # Convert ObjectId to string for each habit
-        for habit in habits:
-            habit["_id"] = str(habit["_id"])
-
-        return {"habits": habits}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.put("/update-habit/completed/{habit_id}")
-async def complete_habit(habit_id: str):
-    try:
-        # Validate the habit_id as a MongoDB ObjectId
-        object_id = ObjectId(habit_id)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid habit ID")
-
-    # Update the habit in MongoDB
-    update_result =  habits_collection.update_one(
-        {"_id": object_id},
-        {"$set": {"completed": True, "skipped": False}}
-    )
-
-    if update_result.modified_count == 1:
-        return {"message": "Habit marked as completed"}
-    else:
-        raise HTTPException(status_code=404, detail="Habit not found")
+    habit_dict = habit.dict()
+    habit_dict["createdAt"] = datetime.now()
+    result =  habits_collection.insert_one(habit_dict)
+    return {"message": "Habit logged", "habitId": str(result.inserted_id)}
 
 
-
-class SkipHabitRequest(BaseModel):
-    reason: str
-
-
-
-@app.put("/update-habit/skipped/{habit_id}")
-async def skip_habit(habit_id: str, request: SkipHabitRequest):
-    try:
-        object_id = ObjectId(habit_id)  # Validate the ObjectId
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid habit ID")
-
-    tip = generate_tip(request.reason)
-    update_result =  habits_collection.update_one(
-        {"_id": object_id},
-        {"$set": {"skipped": True, "completed": False, "reason": request.reason, "tip": tip}}
-    )
-
-    if update_result.modified_count == 1:
-        return {"message": "Habit marked as skipped", "tip": tip}
-    else:
-        raise HTTPException(status_code=404, detail="Habit not found")
-
-def generate_tip(reason: str) -> str:
-    prompt_template = f"Generate a motivational tip for someone who says they skipped a habit because: '{reason}'."
-    response = generate_response(prompt_template)
-    if response:
-        return response
-    else:
-        return "Consistency is key. Don’t be too hard on yourself—start again tomorrow!"
-    
-
-@app.put("/update-habit/undo/{habit_id}")
-async def undo_habit(habit_id: str):
-    update_result =  habits_collection.update_one(
-        {"_id": ObjectId(habit_id)},
-        {"$set": {"completed": False, "skipped": False, "reason": None, "tip": None}}
-    )
-
-    if update_result.modified_count == 1:
-        return {"message": "Habit status reset successfully"}
-    else:
-        raise HTTPException(status_code=404, detail="Habit not found")
+@app.delete("/delete-habit/{habit_id}")
+async def delete_habit(habit_id: str):
+    result = habits_collection.delete_one({"_id": ObjectId(habit_id)})
+    if result.deleted_count == 0:
+        return {"message": "Habit not found"}, 404
+    return {"message": "Habit deleted successfully"}, 200
