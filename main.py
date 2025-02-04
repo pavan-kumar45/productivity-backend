@@ -192,19 +192,35 @@ async def submit_recovery(input: RecoveryInput):
 db = client.habit_tracker
 habits_collection = db.habits
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
 class HabitInstance(BaseModel):
+    _id: Optional[str] = None
     datetime: datetime
     status: str = "pending"
     reason: Optional[str] = None
     tip: Optional[str] = None
+    recovery: Optional[str] = None
 
 class Habit(BaseModel):
     userId: str
     title: str
     repetition: str
     customDays: List[str] = []
-    time: Optional[str] = "00:00"  # Default to "00:00" if not provided
+    time: Optional[str] = "00:00"
     instances: List[HabitInstance] = []
+
+class RecoveryUpdate(BaseModel):
+    logId: str
+    userId: str
+    recovery: str
 
 def is_due_today(habit: dict, today: datetime) -> bool:
     if habit["repetition"] == "daily":
@@ -379,3 +395,51 @@ async def delete_habit(habit_id: str):
     if result.deleted_count == 0:
         return {"message": "Habit not found"}, 404
     return {"message": "Habit deleted successfully"}, 200
+
+
+
+@app.post("/submit-completion-method")
+async def submit_completion_method(data: dict):
+    habit_id = data.get("habitId")
+    completion_method = data.get("completionMethod")
+    instance_datetime_str = data.get("instanceDatetime")
+    
+    if not all([habit_id, completion_method, instance_datetime_str]):
+        raise HTTPException(status_code=400, detail="Missing required fields.")
+    
+    try:
+        instance_datetime = datetime.fromisoformat(instance_datetime_str)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid datetime format.")
+
+    # Find the habit document
+    habit = habits_collection.find_one({"_id": ObjectId(habit_id)})
+    if not habit:
+        raise HTTPException(status_code=404, detail="Habit not found.")
+
+    # Find and update the specific instance
+    updated = False
+    instances = habit.get("instances", [])
+    for idx, inst in enumerate(instances):
+        if inst["datetime"] == instance_datetime:
+            instances[idx]["recovery"] = completion_method
+            updated = True
+            break
+
+    if not updated:
+        raise HTTPException(status_code=404, detail="Instance not found.")
+
+    # Update in database
+    habits_collection.update_one(
+        {"_id": ObjectId(habit_id)},
+        {"$set": {"instances": instances}}
+    )
+
+    return {"message": "Completion method updated successfully"}
+
+
+
+
+
+
+
