@@ -343,6 +343,7 @@ from datetime import datetime
 @app.put("/skip-instance/{habit_id}")
 async def skip_instance(
     habit_id: str,
+    title: str = Query(...),
     reason: str = Query(...),
     instance_datetime: str = Query(...),  # Date string
 ):
@@ -350,7 +351,7 @@ async def skip_instance(
     instance_datetime = datetime.fromisoformat(instance_datetime)
 
     # Generate AI-powered tip
-    prompt_template = f"""Generate a short, empathetic motivational tip for someone who skipped their habit because '{reason}'. 
+    prompt_template = f"""Generate a short, empathetic motivational tip for someone who skipped their habit {title} because '{reason}'. 
     Encourage them to keep going tomorrow. Keep it under 2 sentences and use a friendly tone."""
     
     tip = generate_response(prompt_template, max_tokens=100)  # Get AI-generated tip
@@ -436,6 +437,52 @@ async def submit_completion_method(data: dict):
     )
 
     return {"message": "Completion method updated successfully"}
+
+
+@app.put("/undo-instance/{habit_id}")
+async def undo_instance(
+    habit_id: str,
+    instance_datetime: str = Query(...),  # Date string
+):
+    """
+    Endpoint to undo the status of a habit instance.
+    """
+    try:
+        # Print the received data
+        print(f"Received habit_id: {habit_id}, instance_datetime: {instance_datetime}")
+
+        # Convert the string to a datetime object
+        instance_datetime = datetime.fromisoformat(instance_datetime)
+
+        # Check if the instance_datetime is today
+        today = datetime.now().date()
+        if instance_datetime.date() != today:
+            raise HTTPException(status_code=400, detail="Can only undo instances from today.")
+
+        # Update the habit instance using the datetime object
+        update_result = habits_collection.update_one(
+            {
+                "_id": ObjectId(habit_id),
+                "instances.datetime": instance_datetime,
+                "instances.status": {"$ne": "pending"}
+            },
+            {
+                "$set": {
+                    "instances.$.status": "pending",
+                    "instances.$.reason": None,
+                    "instances.$.tip": None
+                }
+            }
+        )
+
+        if update_result.modified_count == 0:
+            return {"error": "No matching instance found"}
+
+        return {"message": "Instance status reset to pending successfully"}
+
+    except Exception as e:
+        print(f"An error occurred: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
 
 
 
